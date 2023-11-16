@@ -125,13 +125,14 @@ def _add_incoming_needs(items):
     For each item, records all items that need that item in
     ._incoming_needs.
     """
+    mapping = {}
     for item in items:
-        item._incoming_needs = set()
-        for depending_item in items:
-            if item == depending_item:
-                continue
-            if item.id in depending_item._flattened_deps_needs:
-                item._incoming_needs.add(depending_item)
+        for other_item_id in item._flattened_deps_needs:
+            mapping.setdefault(other_item_id, set())
+            mapping[other_item_id].add(item)
+
+    for item in items:
+        item._incoming_needs = mapping.get(item.id, set())
 
 
 def _prepare_auto_attrs(items):
@@ -149,6 +150,8 @@ def _prepare_auto_attrs(items):
 
 
 def _prepare_deps(items):
+    selector_cache = {}
+
     for item in items:
         item._deps = set()  # holds all item ids blocking execution of that item
         for dep_type, deps in (
@@ -157,21 +160,29 @@ def _prepare_deps(items):
         ):
             setattr(item, '_deps_' + dep_type, set())
             for dep in deps:
-                try:
-                    resolved_deps = tuple(resolve_selector(dep, items, originating_item_id=item.id))
-                except NoSuchItem:
-                    raise ItemDependencyError(_(
-                        "'{item}' in bundle '{bundle}' has a dependency ({dep_type}) "
-                        "on '{dep}', which doesn't exist"
-                    ).format(
-                        item=item.id,
-                        bundle=item.bundle.name,
-                        dep=dep,
-                        dep_type=dep_type,
-                    ))
+                if dep in selector_cache:
+                    resolved_deps = selector_cache[dep]
                 else:
-                    item._deps.update(resolved_deps)
-                    getattr(item, '_deps_' + dep_type).update(resolved_deps)
+                    try:
+                        resolved_deps = tuple(resolve_selector(dep, items))
+                    except NoSuchItem:
+                        raise ItemDependencyError(_(
+                            "'{item}' in bundle '{bundle}' has a dependency ({dep_type}) "
+                            "on '{dep}', which doesn't exist"
+                        ).format(
+                            item=item.id,
+                            bundle=item.bundle.name,
+                            dep=dep,
+                            dep_type=dep_type,
+                        ))
+
+                    selector_cache[dep] = resolved_deps
+
+                # Don't put the item itself into its own deps.
+                resolved_deps = tuple(filter(lambda i: i.id != item.id, resolved_deps))
+
+                item._deps.update(resolved_deps)
+                getattr(item, '_deps_' + dep_type).update(resolved_deps)
 
 
 def _inject_canned_actions(items):
@@ -269,9 +280,13 @@ def _inject_concurrency_blockers(items, node_os, node_os_version):
         ))
         processed_items = set()
         for item in type_items:
-            # disregard deps to items of other types
+            # disregard deps to items of other types and to canned
+            # actions
             item.__deps = set(filter(
-                lambda dep: dep.split(":", 1)[0] in blocked_types,
+                lambda dep: (
+                    dep.split(":", 1)[0] in blocked_types and
+                    dep.count(":") == 1
+                ),
                 item._flattened_deps,
             ))
         previous_item = None
